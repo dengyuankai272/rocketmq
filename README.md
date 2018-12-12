@@ -2,7 +2,7 @@
 A RocketMQ client for golang supportting producer and consumer.
 
 # Import package
-import "github.com/sevenNt/rocketmq"
+import "github.com/dengyuankai272/rocketmq"
 
 # Getting started
 ### Getting message with consumer

@@ -67,37 +67,58 @@ func (d *DefaultRemotingClient) ScanResponseTable() {
 
 }
 
-func (d *DefaultRemotingClient) getAndCreateConn(addr string) (conn net.Conn, ok bool) {
+// get connection from cache or create a new connection
+func (d *DefaultRemotingClient) getAndCreateConn(addr string) (conn net.Conn, err error) {
 	// TODO optimize algorithm of getting a nameserver connection
-	if strings.ContainsAny(addr, ";") {
-		namesrvAddrList := strings.Split(addr, ";")
-		namesrvAddrListlen := len(namesrvAddrList)
-		namesrvAddr, namesrvAddrList := removeOne(rand.Intn(namesrvAddrListlen), namesrvAddrList)
 
-		var err error
-		for i := 0; i < namesrvAddrListlen-1; i++ {
-			conn, err = d.connect(namesrvAddr)
-			if err != nil {
-				fmt.Println("getAndCreateConn error, ", err)
-				namesrvAddr, namesrvAddrList = removeOne(rand.Intn(namesrvAddrListlen), namesrvAddrList)
-			} else {
-				d.namesrvAddrChosen = namesrvAddr
-				break
-			}
-		}
-		addr = d.namesrvAddrChosen
-	}
-
+	// get from cache first
+	var ok bool
 	d.connTableLock.RLock()
 	conn, ok = d.connTable[addr]
 	d.connTableLock.RUnlock()
+	if ok {
+		return
+	}
+
+	// create connection by addr
+	if strings.ContainsAny(addr, ";") {
+		namesrvAddrList := strings.Split(addr, ";")
+		namesrvAddrListlen := len(namesrvAddrList)
+
+		var namesrvAddr string
+		for i := 0; i < namesrvAddrListlen; i++ {
+			namesrvAddr, namesrvAddrList = removeOne(namesrvAddrList)
+
+			conn, err = d.connect(namesrvAddr)
+			if err != nil {
+				fmt.Println("getAndCreateConn error, ", err)
+			} else {
+				break
+			}
+		}
+	} else {
+		conn, err = d.connect(addr)
+		if err != nil {
+			fmt.Println("getAndCreateConn error, ", err)
+			return
+		}
+	}
+
+	if err != nil {
+		return
+	}
+
+	// cache connection
+	d.connTableLock.Lock()
+	d.connTable[addr] = conn
+	d.connTableLock.Unlock()
 
 	return
 }
 
-func removeOne(index int, namesrvAddrList []string) (namesrvAddr string, newNamesrvAddrList []string) {
+func removeOne(namesrvAddrList []string) (namesrvAddr string, newNamesrvAddrList []string) {
 	namesrvAddrListlen := len(namesrvAddrList)
-	index = rand.Intn(namesrvAddrListlen)
+	index := rand.Intn(namesrvAddrListlen)
 	namesrvAddr = namesrvAddrList[index]
 	namesrvAddrList[index] = namesrvAddrList[namesrvAddrListlen-1]
 	newNamesrvAddrList = namesrvAddrList[:namesrvAddrListlen-1]
@@ -131,14 +152,9 @@ func (d *DefaultRemotingClient) connect(addr string) (conn net.Conn, err error) 
 }
 
 func (d *DefaultRemotingClient) invokeSync(addr string, request *RemotingCommand, timeoutMillis int64) (*RemotingCommand, error) {
-	conn, ok := d.getAndCreateConn(addr)
-	var err error
-	if !ok {
-		conn, err = d.connect(addr)
-		if err != nil {
-			fmt.Println(err)
-			return nil, err
-		}
+	conn, err := d.getAndCreateConn(addr)
+	if err != nil {
+		return nil, err
 	}
 
 	response := &ResponseFuture{
@@ -156,11 +172,24 @@ func (d *DefaultRemotingClient) invokeSync(addr string, request *RemotingCommand
 	d.responseTable[request.Opaque] = response
 	d.responseTableLock.Unlock()
 
-	err = d.sendRequest(header, body, conn, addr)
+	err = d.sendRequest(header, body, conn)
 	if err != nil {
-		fmt.Println("invokeSync:err", err)
-		return nil, err
+		fmt.Println("invokeSync error: ", err.Error())
+
+		// try reconnect to another name server
+		d.releaseConn(addr, conn)
+		conn, err = d.getAndCreateConn(addr)
+		if err != nil {
+			return nil, err
+		}
+		err = d.sendRequest(header, body, conn)
+		if err != nil {
+			fmt.Println("retry invokeSync error: ", err.Error())
+			d.releaseConn(addr, conn)
+			return nil, err
+		}
 	}
+
 	select {
 	case <-response.done:
 		return response.responseCommand, nil
@@ -197,12 +226,12 @@ func (d *DefaultRemotingClient) invokeAsync(addr string, request *RemotingComman
 
 	header := request.encodeHeader()
 	body := request.Body
-	err = d.sendRequest(header, body, conn, addr)
+	err = d.sendRequest(header, body, conn)
 	if err != nil {
 		fmt.Println(err)
-		return err
+		d.releaseConn(addr, conn)
 	}
-	return nil
+	return
 }
 
 func (d *DefaultRemotingClient) invokeOneway(addr string, request *RemotingCommand, timeoutMillis int64) (err error) {
@@ -222,7 +251,12 @@ func (d *DefaultRemotingClient) invokeOneway(addr string, request *RemotingComma
 	header := request.encodeHeader()
 	body := request.Body
 
-	return d.sendRequest(header, body, conn, addr)
+	err = d.sendRequest(header, body, conn)
+	if err != nil {
+		fmt.Println(err)
+		d.releaseConn(addr, conn)
+	}
+	return
 }
 
 func (d *DefaultRemotingClient) handlerConn(conn net.Conn, addr string) {
@@ -350,7 +384,7 @@ func (d *DefaultRemotingClient) handlerConn(conn net.Conn, addr string) {
 	}
 }
 
-func (d *DefaultRemotingClient) sendRequest(header, body []byte, conn net.Conn, addr string) error {
+func (d *DefaultRemotingClient) sendRequest(header, body []byte, conn net.Conn) error {
 
 	buf := bytes.NewBuffer([]byte{})
 	binary.Write(buf, binary.BigEndian, int32(len(header)+len(body)+4))
@@ -358,20 +392,17 @@ func (d *DefaultRemotingClient) sendRequest(header, body []byte, conn net.Conn, 
 	_, err := conn.Write(buf.Bytes())
 
 	if err != nil {
-		d.releaseConn(addr, conn)
 		return err
 	}
 
 	_, err = conn.Write(header)
 	if err != nil {
-		d.releaseConn(addr, conn)
 		return err
 	}
 
 	if body != nil && len(body) > 0 {
 		_, err = conn.Write(body)
 		if err != nil {
-			d.releaseConn(addr, conn)
 			return err
 		}
 	}
