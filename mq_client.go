@@ -495,7 +495,7 @@ func (m *MqClient) sendHeartbeatToAllBrokerWithLock() error {
 				return err
 			}
 			remotingCommand.Body = data
-			fmt.Fprintln(os.Stderr, "send heartbeat to broker[", addr+"]")
+			fmt.Fprintln(os.Stdout, "send heartbeat to broker[", addr+"]")
 			response, err := m.remotingClient.invokeSync(addr, remotingCommand, 3000)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
